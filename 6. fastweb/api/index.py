@@ -1,19 +1,22 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 from typing import List, Optional, Any, Dict
 from functools import lru_cache
 import re
 import time
+import os
+from pathlib import Path
 
 from gradio_client import Client
 
-#App
+HF_SPACE = os.getenv("HF_SPACE", "Om-2003/steam-game-search-ui")
+
+
+
 app = FastAPI(title="Steam Semantic Search API")
 
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -22,22 +25,25 @@ def serve_frontend():
         return f.read()
 
 
-#HF Client
-HF_SPACE = "Om-2003/steam-game-search-ui"
+@app.get("/static/styles.css")
+def serve_css():
+    """Serve the CSS file"""
+    with open("static/styles.css", "r", encoding="utf-8") as f:
+        return Response(content=f.read(), media_type="text/css")
+
+
+
+# HF client ... lazy load + retry
 _client: Optional[Client] = None
 
 
 def get_client() -> Client:
-    """
-    Lazy-load HF client. Prevents server crash at import time.
-    Retries multiple times because HF DNS / sleep is common.
-    """
     global _client
     if _client is not None:
         return _client
 
     last_err = None
-    for _ in range(4):  # retries
+    for _ in range(4):
         try:
             _client = Client(HF_SPACE)
             return _client
@@ -48,7 +54,8 @@ def get_client() -> Client:
     raise RuntimeError("Failed to connect to Hugging Face Space") from last_err
 
 
-#Models
+
+
 class SearchRequest(BaseModel):
     query: str
     top_k: Optional[int] = 10
@@ -68,23 +75,22 @@ class GameResult(BaseModel):
     short_description: Optional[str] = None
     description: Optional[str] = None
     match_reason: Optional[List[str]] = None
+    ai_reason: Optional[str] = None   
 
 
-#Utils
+class SearchResponse(BaseModel):
+    global_summary: Optional[str] = None
+    results: List[GameResult]
+
+
+
+
 def tokenize(text: str) -> List[str]:
     text = re.sub(r"[^a-zA-Z0-9 ]", "", text.lower())
     return [w for w in text.split() if len(w) > 2]
 
 
 def safe_float(v) -> Optional[float]:
-    """
-    HF sometimes returns:
-      - numbers
-      - None
-      - "Missing"
-      - "N/A"
-    This prevents FastAPI ResponseValidationError.
-    """
     if v is None:
         return None
     if isinstance(v, (int, float)):
@@ -108,35 +114,40 @@ def safe_list(v) -> Optional[List[str]]:
     return None
 
 
-def normalize_hf_output(raw: Any) -> List[Dict]:
+def normalize_hf_output(raw: Any):
     """
-    Gradio sometimes returns:
+    HF can return:
       - list[dict]
       - dict with "data"
+      - dict with {results, global_summary}
     """
     if raw is None:
-        return []
+        return {"results": [], "global_summary": None}
 
     if isinstance(raw, list):
-        return raw
+        return {"results": raw, "global_summary": None}
 
-    if isinstance(raw, dict) and "data" in raw:
-        # sometimes raw["data"] = [results]
-        d = raw.get("data")
-        if isinstance(d, list) and len(d) > 0 and isinstance(d[0], list):
-            return d[0]
-        if isinstance(d, list):
-            return d
+    if isinstance(raw, dict):
 
-    return []
+        # If already enriched with summary
+        if "results" in raw:
+            return raw
+
+        if "data" in raw:
+            d = raw.get("data")
+            if isinstance(d, list) and len(d) > 0 and isinstance(d[0], list):
+                return {"results": d[0], "global_summary": None}
+            if isinstance(d, list):
+                return {"results": d, "global_summary": None}
+
+    return {"results": [], "global_summary": None}
 
 
-#HF Search (Cached)
+
+# Hugging face search cached
+
 @lru_cache(maxsize=500)
-def hf_search_cached(query: str, top_k: int) -> List[Dict]:
-    """
-    Cached call. Retries because HF spaces sleep.
-    """
+def hf_search_cached(query: str, top_k: int):
     client = get_client()
 
     last_err = None
@@ -148,6 +159,7 @@ def hf_search_cached(query: str, top_k: int) -> List[Dict]:
                 api_name="/search_games"
             )
             return normalize_hf_output(raw)
+
         except Exception as e:
             last_err = e
             time.sleep(1.2 + attempt * 0.7)
@@ -155,33 +167,35 @@ def hf_search_cached(query: str, top_k: int) -> List[Dict]:
     raise RuntimeError("HF Space failed after retries") from last_err
 
 
-#API
-@app.post("/search", response_model=List[GameResult])
+# api endpoint
+
+@app.post("/search", response_model=SearchResponse)
 def search_games(req: SearchRequest):
+
     query = (req.query or "").strip()
     if not query:
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
     top_k = req.top_k or 10
-    if top_k < 1:
-        top_k = 1
-    if top_k > 20:
-        top_k = 20
+    top_k = max(1, min(top_k, 20))
 
     # HF CALL
     try:
-        games = hf_search_cached(query, top_k)
+        hf_data = hf_search_cached(query, top_k)
     except Exception:
         raise HTTPException(
             status_code=503,
             detail="Hugging Face backend unavailable (Space sleeping/down). Try again in 30–90 seconds."
         )
 
-    # MATCH REASON
+    raw_games = hf_data.get("results", [])
+    global_summary = hf_data.get("global_summary")
+
     query_tokens = tokenize(query)
 
     cleaned: List[Dict] = []
-    for g in games:
+
+    for g in raw_games:
         if not isinstance(g, dict):
             continue
 
@@ -201,13 +215,19 @@ def search_games(req: SearchRequest):
             "screenshots": safe_list(g.get("screenshots")),
             "short_description": g.get("short_description"),
             "description": g.get("description"),
-            "match_reason": reasons
+            "match_reason": reasons,
+            "ai_reason": g.get("ai_reason")   # ← ADD THIS
         })
 
-    # sort by similarity desc
-    cleaned.sort(key=lambda x: x.get("similarity_score") or 0, reverse=True)
+    cleaned.sort(
+        key=lambda x: x.get("similarity_score") or 0,
+        reverse=True
+    )
 
-    return cleaned[:top_k]
+    return {
+        "global_summary": global_summary,
+        "results": cleaned[:top_k]
+    }
 
 
 # Required for Vercel
