@@ -1,10 +1,17 @@
+import os
 import gradio as gr
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from huggingface_hub import login
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
+from openai import OpenAI
 
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+if HF_TOKEN:
+    login(token=HF_TOKEN)
 
 BASE_DIR = Path(__file__).parent
 
@@ -78,7 +85,6 @@ df_search_index = (
 
 df_search_index["name"] = df_search_index["name"].fillna("Unknown Game")
 
-
 df_search_index = df_search_index.rename(
     columns={"price_usd": "price"}
 )
@@ -88,10 +94,68 @@ model = SentenceTransformer("BAAI/bge-m3")
 print("Ready!")
 
 
+# ---------------------------
+# LLM SETUP (SAFE)
+# ---------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+llm_client = None
 
+if OPENAI_API_KEY:
+    try:
+        llm_client = OpenAI(api_key=OPENAI_API_KEY)
+        print("LLM client initialized.")
+    except Exception:
+        print("LLM initialization failed.")
+
+
+# ---------------------------
+# GLOBAL EXPLANATION FUNCTION
+# ---------------------------
+def generate_global_explanation(query, games):
+    if not llm_client or not games:
+        return None
+
+    context = ""
+    for g in games[:5]:
+        context += f"""
+Game: {g.get('name')}
+Genre: {g.get('primary_genre')}
+Description: {g.get('short_description')}
+Sentiment: {g.get('avg_sentiment_score')}
+---
+"""
+
+    prompt = f"""
+User searched: "{query}"
+
+Based on the following games:
+
+{context}
+
+Explain briefly (4-6 lines):
+1. Why these games match the query
+2. What type of player would enjoy them
+Keep it concise and insightful.
+"""
+
+    try:
+        response = llm_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.6,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception:
+        return None
+
+
+
+# ---------------------------
+# SEARCH FUNCTION (UNCHANGED LOGIC + ADDITION)
+# ---------------------------
 def search_games(query, top_k):
     if not query.strip():
-        return []
+        return {"results": [], "explanation": None}
 
     query_vec = model.encode(query).reshape(1, -1)
     similarities = cosine_similarity(query_vec, game_embeddings)[0]
@@ -104,8 +168,7 @@ def search_games(query, top_k):
         "https://store.steampowered.com/app/" + results["appid"] + "/"
     )
 
-    # json type output
-    return results[
+    final_results = results[
         [
             "name",
             "steam_url",
@@ -121,7 +184,19 @@ def search_games(query, top_k):
         ]
     ].fillna("Missing").to_dict(orient="records")
 
-#create gradio ui 
+    # -------- NEW: GLOBAL EXPLANATION --------
+    explanation = generate_global_explanation(query, final_results)
+
+    return {
+        "results": final_results,
+        "explanation": explanation
+    }
+
+
+
+# ---------------------------
+# GRADIO UI (UNCHANGED)
+# ---------------------------
 with gr.Blocks(title="Steam Semantic Game Search") as demo:
     gr.Markdown("# 🎮 Steam Semantic Game Search")
     gr.Markdown("Search Steam games using natural language")
