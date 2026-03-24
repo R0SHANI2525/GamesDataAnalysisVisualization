@@ -392,6 +392,29 @@ button:disabled {
 }
 
 .details a:hover{ text-decoration: underline; }
+
+/* AI Explanation Box */
+.ai-box{
+  margin-top: 24px;
+  padding: 18px;
+  border-radius: 14px;
+  border: 1px solid rgba(102,192,244,0.18);
+  background: rgba(42,71,94,0.45);
+  backdrop-filter: blur(6px);
+}
+
+.ai-box h3{
+  margin-top: 0;
+  color: var(--accent);
+  font-size: 1.05rem;
+  font-weight: 900;
+}
+
+.ai-box p{
+  margin: 10px 0 0 0;
+  line-height: 1.5;
+  opacity: .95;
+}
 </style>
 </head>
 
@@ -418,6 +441,8 @@ button:disabled {
     <button id="btn">Find Games</button>
     <div class="status" id="status"></div>
   </div>
+
+  <div id="globalAIBox" style="display:none;"></div>
 
   <div class="grid" id="results"></div>
 </div>
@@ -548,13 +573,29 @@ function renderDetails(){
     <div class="line"><strong>Match:</strong> ${score}%</div>
     ${price ? `<div class="line"><strong>Price:</strong> ${price}</div>` : ""}
     ${genre ? `<div class="line"><strong>Genre:</strong> ${genre}</div>` : ""}
-    ${sentiment ? `<div class="line"><strong>Sentiment:</strong> ⭐ ${sentiment}</div>` : ""}
+    ${sentiment ? `<div class="line"><strong>Sentiment Score:</strong>  ${sentiment} / 5 ⭐</div>` : ""}
     ${desc ? `<div class="line"><strong>Description:</strong><br>${desc}</div>` : ""}
-    ${g.steam_url ? `<div class="line"><strong>Steam:</strong> <a href="${g.steam_url}" target="_blank">${g.steam_url}</a></div>` : ""}
-    <div class="line" style="margin-top:12px;">
-      <a href="https://www.youtube.com/results?search_query=${encodeURIComponent((g.name||"") + " gameplay")}" target="_blank">
-        Search gameplay on YouTube →
-      </a>
+
+    ${g.ai_reason ? `
+      <div class="ai-box">
+        <h3>Why this game?</h3>
+        <p>${g.ai_reason}</p>
+      </div>
+    ` : ""}
+
+    <div class="line" style="margin-top:14px;">
+      <div class="actions">
+        ${g.steam_url ? `
+          <a class="primary" href="${g.steam_url}" target="_blank">
+            View on Steam
+          </a>
+        ` : ""}
+        <a class="secondary"
+          href="https://www.youtube.com/results?search_query=${encodeURIComponent((g.name||"") + " gameplay")}"
+          target="_blank">
+          Gameplay
+        </a>
+      </div>
     </div>
   `;
 }
@@ -631,14 +672,31 @@ async function runSearch() {
     const raw = await res.text();
     if (!res.ok) throw new Error(raw || "Backend error");
 
-    const data = JSON.parse(raw);
+    const response = JSON.parse(raw);
 
-    if (!Array.isArray(data) || data.length === 0) {
+    if (!response.results || !response.results.length) {
       statusEl.textContent = "No results found.";
       return;
     }
 
+    const data = response.results;
+
     statusEl.textContent = `Found ${data.length} games`;
+
+    // Global AI Summary
+    const globalBox = document.getElementById("globalAIBox");
+
+    if (response.global_summary) {
+      globalBox.innerHTML = `
+        <div class="ai-box">
+          <h3>Why these games?</h3>
+          <p>${response.global_summary}</p>
+        </div>
+      `;
+      globalBox.style.display = "block";
+    } else {
+      globalBox.style.display = "none";
+    }
 
     resultsEl.innerHTML = data.map((g, idx) => {
       const score = ((g.similarity_score || 0) * 100).toFixed(1);
